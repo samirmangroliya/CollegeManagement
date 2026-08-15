@@ -1,0 +1,56 @@
+# Git and version control
+.git
+.gitignore
+.gitattributes
+
+# IDE and editor files
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.classpath
+.c9
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+!.env.dev.example
+!.env.prod.example
+
+# Build output and caches
+target/
+build/
+.gradle/
+**/node_modules/
+**/.cache/
+*.log
+*.tmp
+*.pid
+
+tmp/
+temp/
+coverage/
+htmlcov/
+.pytest_cache/
+.junit/
+
+# Documentation and metadata not needed for the image
+README.md
+HELP.md
+*.md
+docs/
+javadoc/
+.github/
+
+# Docker context noise
+Dockerfile
+.dockerignore
+docker-compose*.yml
+compose.yml
