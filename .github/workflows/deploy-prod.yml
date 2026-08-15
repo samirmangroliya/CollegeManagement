@@ -1,0 +1,151 @@
+name: Production Deployment
+
+on:
+  push:
+    branches:
+      - main
+      - production
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: college-management
+  ECS_CLUSTER: college-management-cluster
+  ECS_SERVICE: college-management-service
+  ECS_TASK_DEFINITION: college-management
+  CONTAINER_NAME: college-management
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Extract metadata
+        id: meta
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
+          echo "image=${ECR_REGISTRY}/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "latest=${ECR_REGISTRY}/${{ env.ECR_REPOSITORY }}:latest" >> $GITHUB_OUTPUT
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}
+            ${{ steps.meta.outputs.latest }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy-to-ecs:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Update ECS task definition with new image
+        id: taskdef
+        run: |
+          ECR_REGISTRY=$(aws ecr describe-registry --region ${{ secrets.AWS_REGION || env.AWS_REGION }} --query 'registryId' --output text)
+          IMAGE_URI=${ECR_REGISTRY}.dkr.ecr.${{ secrets.AWS_REGION || env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECS_TASK_DEFINITION }} \
+            --region ${{ secrets.AWS_REGION || env.AWS_REGION }} \
+            --query taskDefinition > task-definition.json
+
+          jq \
+            --arg image "$IMAGE_URI" \
+            '.containerDefinitions[0].image = $image | del(.taskDefinitionArn) | del(.revision) | del(.status) | del(.requiresAttributes) | del(.compatibilities) | del(.registeredAt) | del(.registeredBy)' \
+            task-definition.json > new-task-definition.json
+
+          aws ecs register-task-definition \
+            --region ${{ secrets.AWS_REGION || env.AWS_REGION }} \
+            --cli-input-json file://new-task-definition.json > task-definition-output.json
+
+          TASK_REVISION=$(jq -r '.taskDefinition.revision' task-definition-output.json)
+          echo "revision=${TASK_REVISION}" >> $GITHUB_OUTPUT
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --task-definition ${{ env.ECS_TASK_DEFINITION }}:${{ steps.taskdef.outputs.revision }} \
+            --force-new-deployment \
+            --region ${{ secrets.AWS_REGION || env.AWS_REGION }}
+
+      - name: Wait for ECS deployment to finish
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --region ${{ secrets.AWS_REGION || env.AWS_REGION }}
+
+      - name: Verify ECS service status
+        run: |
+          aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --region ${{ secrets.AWS_REGION || env.AWS_REGION }} \
+            --query 'services[0].deployments[0].status' \
+            --output text
+
+  smoke-tests:
+    needs: deploy-to-ecs
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Health check via ALB or EC2 endpoint
+        run: |
+          echo "Deployment completed to AWS ECS. Add your ALB URL or EC2 health endpoint here."
+          echo "Example: curl -f https://your-alb-url/actuator/health"
+
+      - name: Notification - Success
+        if: success()
+        run: |
+          echo "✅ AWS production deployment successful!"
+
+      - name: Notification - Failure
+        if: failure()
+        run: |
+          echo "❌ AWS production deployment failed!"
+          exit 1
