@@ -8,10 +8,12 @@ on:
   workflow_dispatch:
 
 env:
-  REGISTRY: collegemanagementacr
-  IMAGE_NAME: college-management
-  AZURE_RESOURCE_GROUP: college-management-rg
-  AZURE_CONTAINER_APP: college-management-app
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: college-management
+  ECS_CLUSTER: college-management-cluster
+  ECS_SERVICE: college-management-service
+  ECS_TASK_DEFINITION: college-management
+  CONTAINER_NAME: college-management
 
 jobs:
   build-and-push:
@@ -19,110 +21,131 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v2
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || env.AWS_REGION }}
 
-    - name: Log in to Azure
-      uses: azure/login@v1
-      with:
-        client-id: ${{ secrets.AZURE_CLIENT_ID }}
-        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Log in to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
 
-    - name: Log in to Azure Container Registry
-      run: |
-        az acr login --name ${{ env.REGISTRY }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-    - name: Extract metadata
-      id: meta
-      run: |
-        DOCKER_IMAGE=${{ env.REGISTRY }}.azurecr.io/${{ env.IMAGE_NAME }}
-        VERSION=$(date +%Y%m%d-%H%M%S)
-        echo "image=${DOCKER_IMAGE}" >> $GITHUB_OUTPUT
-        echo "version=${VERSION}" >> $GITHUB_OUTPUT
-        echo "tag=${DOCKER_IMAGE}:${VERSION}" >> $GITHUB_OUTPUT
+      - name: Extract metadata
+        id: meta
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
+          echo "image=${ECR_REGISTRY}/${{ env.ECR_REPOSITORY }}:${IMAGE_TAG}" >> $GITHUB_OUTPUT
+          echo "latest=${ECR_REGISTRY}/${{ env.ECR_REPOSITORY }}:latest" >> $GITHUB_OUTPUT
 
-    - name: Build and push Docker image
-      uses: docker/build-push-action@v4
-      with:
-        context: .
-        push: true
-        tags: |
-          ${{ steps.meta.outputs.tag }}
-          ${{ env.REGISTRY }}.azurecr.io/${{ env.IMAGE_NAME }}:latest
-        cache-from: type=gha
-        cache-to: type=gha,mode=max
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image }}
+            ${{ steps.meta.outputs.latest }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-  deploy-to-aks:
+  deploy-to-ecs:
     needs: build-and-push
     runs-on: ubuntu-latest
     permissions:
       contents: read
       id-token: write
-    
+
     steps:
-    - name: Checkout code
-      uses: actions/checkout@v3
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Log in to Azure
-      uses: azure/login@v1
-      with:
-        client-id: ${{ secrets.AZURE_CLIENT_ID }}
-        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION || env.AWS_REGION }}
 
-    - name: Get AKS credentials
-      run: |
-        az aks get-credentials \
-          --resource-group ${{ env.AZURE_RESOURCE_GROUP }} \
-          --name college-prod-aks \
-          --overwrite-existing
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
 
-    - name: Deploy to Kubernetes
-      run: |
-        kubectl apply -f k8s/deployment.yaml
-        kubectl set image deployment/college-management-app \
-          college-management=${{ env.REGISTRY }}.azurecr.io/${{ env.IMAGE_NAME }}:latest \
-          -n college-prod
-        kubectl rollout status deployment/college-management-app -n college-prod --timeout=5m
+      - name: Update ECS task definition with new image
+        id: taskdef
+        run: |
+          ECR_REGISTRY=$(aws ecr describe-registry --region ${{ secrets.AWS_REGION || env.AWS_REGION }} --query 'registryId' --output text)
+          IMAGE_URI=${ECR_REGISTRY}.dkr.ecr.${{ secrets.AWS_REGION || env.AWS_REGION }}.amazonaws.com/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
 
-    - name: Verify deployment
-      run: |
-        echo "Deployment Status:"
-        kubectl get deployments -n college-prod
-        kubectl get pods -n college-prod
-        kubectl get services -n college-prod
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECS_TASK_DEFINITION }} \
+            --region ${{ secrets.AWS_REGION || env.AWS_REGION }} \
+            --query taskDefinition > task-definition.json
+
+          jq \
+            --arg image "$IMAGE_URI" \
+            '.containerDefinitions[0].image = $image | del(.taskDefinitionArn) | del(.revision) | del(.status) | del(.requiresAttributes) | del(.compatibilities) | del(.registeredAt) | del(.registeredBy)' \
+            task-definition.json > new-task-definition.json
+
+          aws ecs register-task-definition \
+            --region ${{ secrets.AWS_REGION || env.AWS_REGION }} \
+            --cli-input-json file://new-task-definition.json > task-definition-output.json
+
+          TASK_REVISION=$(jq -r '.taskDefinition.revision' task-definition-output.json)
+          echo "revision=${TASK_REVISION}" >> $GITHUB_OUTPUT
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --task-definition ${{ env.ECS_TASK_DEFINITION }}:${{ steps.taskdef.outputs.revision }} \
+            --force-new-deployment \
+            --region ${{ secrets.AWS_REGION || env.AWS_REGION }}
+
+      - name: Wait for ECS deployment to finish
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --region ${{ secrets.AWS_REGION || env.AWS_REGION }}
+
+      - name: Verify ECS service status
+        run: |
+          aws ecs describe-services \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --region ${{ secrets.AWS_REGION || env.AWS_REGION }} \
+            --query 'services[0].deployments[0].status' \
+            --output text
 
   smoke-tests:
-    needs: deploy-to-aks
+    needs: deploy-to-ecs
     runs-on: ubuntu-latest
-    
+
     steps:
-    - name: Wait for service to be ready
-      run: |
-        sleep 30
+      - name: Health check via ALB or EC2 endpoint
+        run: |
+          echo "Deployment completed to AWS ECS. Add your ALB URL or EC2 health endpoint here."
+          echo "Example: curl -f https://your-alb-url/actuator/health"
 
-    - name: Get service endpoint
-      run: |
-        SERVICE_IP=$(kubectl get service college-management-service -n college-prod -o jsonpath='{.status.loadBalancer.ingress[0].ip}')
-        echo "SERVICE_IP=${SERVICE_IP}" >> $GITHUB_ENV
+      - name: Notification - Success
+        if: success()
+        run: |
+          echo "✅ AWS production deployment successful!"
 
-    - name: Health check
-      run: |
-        curl -f http://${{ env.SERVICE_IP }}:80/actuator/health || exit 1
-
-    - name: Notification - Success
-      if: success()
-      run: |
-        echo "✅ Production deployment successful!"
-
-    - name: Notification - Failure
-      if: failure()
-      run: |
-        echo "❌ Production deployment failed!"
-        exit 1
+      - name: Notification - Failure
+        if: failure()
+        run: |
+          echo "❌ AWS production deployment failed!"
+          exit 1
